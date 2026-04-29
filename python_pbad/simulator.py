@@ -17,17 +17,31 @@ def _autograd_functional_jvp(*args, **kwargs):
 
 
 
-def barrier_eval(d: torch.Tensor, x0: float, d0_offset: float = 0.0
+def barrier_eval(d: torch.Tensor, x0: float, d0_offset: float = 0.0,
+                 mode: str = 'truncated',
                  ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Two support modes; 'truncated' (default) preserves prior behaviour."""
     x = d - d0_offset
     clamp_min = 1e-15 if x.dtype == torch.float64 else 1e-12
     x_s = torch.clamp(x, min=clamp_min)
-    u = x0 / x_s
-    L = torch.log(x_s / x0)
-    val  = -L * (x_s - x0) ** 2 / x_s
-    grad = -(1.0 - u) ** 2 - L * (1.0 - u ** 2)
-    hess = (-(x_s - x0) * (x_s + 3.0 * x0) - 2.0 * x0 ** 2 * L) / (x_s ** 3)
-    active = (x > 0) & (x < x0)
+
+    if mode == 'log':
+        # Global -log barrier (active for all x > 0).
+        val  = -torch.log(x_s)
+        grad = -1.0 / x_s
+        hess = 1.0 / (x_s ** 2)
+        active = x > 0
+    elif mode == 'truncated':
+        # Original: polynomial × log, finite support (0, x0).
+        u = x0 / x_s
+        L = torch.log(x_s / x0)
+        val  = -L * (x_s - x0) ** 2 / x_s
+        grad = -(1.0 - u) ** 2 - L * (1.0 - u ** 2)
+        hess = (-(x_s - x0) * (x_s + 3.0 * x0) - 2.0 * x0 ** 2 * L) / (x_s ** 3)
+        active = (x > 0) & (x < x0)
+    else:
+        raise ValueError(f"barrier_eval: mode must be 'truncated' or 'log', got {mode!r}")
+
     zero = torch.zeros_like(x)
     val  = torch.where(active, val,  zero)
     grad = torch.where(active, grad, zero)
