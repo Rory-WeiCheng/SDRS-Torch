@@ -563,10 +563,12 @@ def contact_zeta_grad(wv: torch.Tensor,
     g_zeta = g_zeta + (-coef * bg_m_a * va_h).sum(dim=1)            # [K, 4]
 
     # Normal-magnitude term: -log(1 − ‖ν‖). Only affects ν (not δ).
+    # Matches contact_energy:638 exactly (no eps_n) — SDRS uses bare norm
+    # in the energy, eps_n only appears in the Hessian (intentional, see
+    # contact_pp_hess docstring).
     p3 = p_stack[:, :3]
-    norm_p = torch.norm(p3, dim=1, keepdim=True).clamp(min=1e-30)   # [K, 1]
+    norm_p = torch.norm(p3, dim=1, keepdim=True).clamp(min=1e-30)
     _, bg_n, _ = barrier_eval(1.0 - torch.norm(p3, dim=1), x0, mode='log')
-    # ∂(1 − ‖ν‖)/∂ν = -ν/‖ν‖.  d(val)/dν = bg · (-ν/‖ν‖).
     g_zeta[:, :3] = g_zeta[:, :3] + coef * bg_n.unsqueeze(1) * (-p3 / norm_p)
 
     if gnd_idx.numel() > 0:
@@ -758,3 +760,181 @@ def damping_u_grad(pn_stack: torch.Tensor,
     g_alpha = (g_u3 * t0).sum(dim=1)
     g_beta = (g_u3 * t1).sum(dim=1)
     return torch.stack([g_alpha, g_beta, g_om], dim=1)              # [K, 3]
+
+
+# ---------------------------------------------------------------------------
+# Inner Hessians: H_pp (contact + normal-mag) and H_uu (friction)
+# ---------------------------------------------------------------------------
+
+def contact_pp_hess(wv: torch.Tensor,
+                    p_stack: torch.Tensor,
+                    lid_a: torch.Tensor,
+                    lid_b: torch.Tensor,
+                    vmask: torch.Tensor,
+                    ground_h: torch.Tensor,
+                    coef: float,
+                    x0: float,
+                    d0_half: float,
+                    eps_n: float = 1e-8) -> torch.Tensor:
+    """``∂²(coef · Σ Ψ_hh')/∂(ν, δ)²`` per pair.   Returns ``[K, 4, 4]`` (PSD).
+
+    Reference: ``simulator.py:1742-1783``. Three contributions, summed:
+        H_pp_a (A-side):   bh_a · vmask · va_h ⊗ va_h         [K, 4, 4]
+        H_pp_b (B-side):   bh_b · vmask · vb_h ⊗ vb_h          [K, 4, 4] (ground or link-link)
+        H_pp_n (normal):   [bh_n · n̂n̂ᵀ - bg_n · (I-n̂n̂ᵀ)/‖ν‖]  → [K, :3, :3] block only
+
+    Final H_pp = coef · (H_pp_a + H_pp_b + H_pp_n), symmetrised.
+    """
+    dev, dty = wv.device, wv.dtype
+    K, max_M = p_stack.shape[0], wv.shape[1]
+    if K == 0:
+        return torch.zeros(0, 4, 4, device=dev, dtype=dty)
+
+    is_ground = lid_b < 0
+    gnd_idx = is_ground.nonzero(as_tuple=True)[0]
+    lnk_idx = (~is_ground).nonzero(as_tuple=True)[0]
+
+    va = wv[lid_a]
+    link_mask_a = vmask[lid_a]
+    ones_KM1 = torch.ones(K, max_M, 1, device=dev, dtype=dty)
+    va_h = torch.cat([va, ones_KM1], dim=2)
+    d_a = -torch.einsum('kmi,ki->km', va_h, p_stack)
+    _, _, bh_a = barrier_eval(d_a, x0, d0_half, mode='log')
+    bh_m_a = bh_a * link_mask_a                                    # [K, M]
+    H_pp_a = torch.einsum('km,kmi,kmj->kij', bh_m_a, va_h, va_h)   # [K, 4, 4]
+
+    H_pp_b = torch.zeros(K, 4, 4, device=dev, dtype=dty)
+    if gnd_idx.numel() > 0:
+        p_gnd = p_stack[gnd_idx]
+        d_b_gnd = torch.einsum('gi,ki->kg', ground_h, p_gnd)        # [K_gnd, Mg]
+        _, _, bh_b_gnd = barrier_eval(d_b_gnd, x0, d0_half, mode='log')
+        H_pp_b[gnd_idx] = torch.einsum(
+            'kg,gi,gj->kij', bh_b_gnd, ground_h, ground_h)
+
+    if lnk_idx.numel() > 0:
+        lid_b_lnk = lid_b[lnk_idx]
+        mask_b_lnk = vmask[lid_b_lnk]
+        vb_next_lnk = wv[lid_b_lnk]
+        ones_lnk = torch.ones(lnk_idx.numel(), max_M, 1, device=dev, dtype=dty)
+        vb_h_lnk = torch.cat([vb_next_lnk, ones_lnk], dim=2)
+        d_b_lnk = torch.einsum('kmi,ki->km', vb_h_lnk, p_stack[lnk_idx])
+        _, _, bh_b_lnk = barrier_eval(d_b_lnk, x0, d0_half, mode='log')
+        bh_b_m = bh_b_lnk * mask_b_lnk
+        H_pp_b[lnk_idx] = torch.einsum(
+            'km,kmi,kmj->kij', bh_b_m, vb_h_lnk, vb_h_lnk)
+
+    # Normal-magnitude term: -log(1 - ‖ν‖). Affects only [:3, :3] sub-block.
+    p3 = p_stack[:, :3]
+    np3 = torch.norm(p3, dim=1, keepdim=True) + eps_n               # [K, 1]
+    n_hat_p = p3 / np3                                              # [K, 3]
+    s_p = 1.0 - np3.squeeze(1)
+    _, bg_n, bh_n = barrier_eval(s_p, x0, mode='log')
+    nn_p = n_hat_p.unsqueeze(2) * n_hat_p.unsqueeze(1)              # [K, 3, 3]
+    eye3 = torch.eye(3, device=dev, dtype=dty)
+    I_nn_p = eye3.unsqueeze(0) - nn_p
+    H_pp_n33 = (bh_n.unsqueeze(1).unsqueeze(2) * nn_p
+                - bg_n.unsqueeze(1).unsqueeze(2) * I_nn_p / np3.unsqueeze(2))
+    H_pp_n = torch.zeros(K, 4, 4, device=dev, dtype=dty)
+    H_pp_n[:, :3, :3] = H_pp_n33
+
+    H_pp = coef * (H_pp_a + H_pp_b + H_pp_n)
+    return 0.5 * (H_pp + H_pp.transpose(1, 2))
+
+
+def damping_uu_hess(pn_stack: torch.Tensor,
+                    u_stack: torch.Tensor,
+                    wv_next: torch.Tensor,
+                    wv_curr: torch.Tensor,
+                    lid_a: torch.Tensor,
+                    lid_b: torch.Tensor,
+                    lnk_idx: torch.Tensor,
+                    vmask: torch.Tensor,
+                    friction: float,
+                    coef: float,
+                    x0: float,
+                    d0_half: float,
+                    dt: float,
+                    eps_n: float = 1e-8,
+                    eps_s: float = 1e-4) -> torch.Tensor:
+    """``∂²(η · Σ D_hh')/∂u_unified²`` per pair.   Returns ``[K, 3, 3]`` (PSD).
+
+    Reference: ``simulator.py:1820-1841`` + ``_friction_reduce_H``.
+
+    Builds the 4×4 Hessian in ``(u_x, u_y, u_z, ω)`` basis from three blocks:
+        H_uu_33 = α·I − VᵀV,     α = Σ_v c/s,   V_mr = √(c/s³)·rel_vel_mr
+        col      = Σ_v c · [r_nx/s − h·rel_vel/s³]                (u↔ω coupling)
+        H_ww     = Σ_v c · [‖r_nx‖²/s − h²/s³]                    (ω diagonal)
+    where ``c = friction · dt · A_m · vmask``, ``h = rel_vel · r_nx``.
+    Then reduces to 3×3 in (α, β, ω) basis via ``Jᵀ H_4 J``,
+    ``J = [t0; t1; 0; 0; 0; 0; 1]`` (the same lift used by ``damping_u_grad``).
+    """
+    dev, dty = wv_next.device, wv_next.dtype
+    K = pn_stack.shape[0]
+    if K == 0:
+        return torch.zeros(0, 3, 3, device=dev, dtype=dty)
+
+    max_M = wv_next.shape[1]
+    va_next = wv_next[lid_a]
+    va_curr = wv_curr[lid_a]
+    link_mask_a = vmask[lid_a]
+    ones_KM1 = torch.ones(K, max_M, 1, device=dev, dtype=dty)
+
+    n_vecs = pn_stack[:, :3]
+    norm_n = torch.norm(n_vecs, dim=1, keepdim=True) + eps_n
+    n_hat = n_vecs / norm_n
+    eye3 = torch.eye(3, device=dev, dtype=dty)
+    Proj = eye3.unsqueeze(0) - n_hat.unsqueeze(2) * n_hat.unsqueeze(1)
+    u_xyz, omega_stack, t0, t1 = _unified_u_to_xyz_omega(u_stack, n_hat)
+
+    vel_a = (va_next - va_curr) / dt
+    vel = vel_a.clone()
+    if lnk_idx.numel() > 0:
+        lid_b_lnk = lid_b[lnk_idx]
+        vb_next_f = wv_next[lid_b_lnk]
+        vb_curr_f = wv_curr[lid_b_lnk]
+        vel[lnk_idx] = vel[lnk_idx] - (vb_next_f - vb_curr_f) / dt
+
+    tan_vel = torch.einsum('kij,kmj->kmi', Proj, vel)
+    r_nx = torch.cross(n_hat.unsqueeze(1), va_curr, dim=2)
+    omega_term = omega_stack.view(K, 1, 1) * r_nx
+    rel_vel = tan_vel - u_xyz.unsqueeze(1) - omega_term
+
+    va_h_fn = torch.cat([va_curr, ones_KM1], dim=2)
+    d_fn = -torch.einsum('kmi,ki->km', va_h_fn, pn_stack)
+    _, bg_fn, _ = barrier_eval(d_fn, x0, d0_half, mode='log')
+    pn3 = pn_stack[:, :3]
+    f_vec = coef * bg_fn.unsqueeze(2) * pn3.unsqueeze(1)
+    fn_sq = f_vec.pow(2).sum(dim=2)
+    A_m = torch.sqrt(fn_sq + eps_s) - (eps_s ** 0.5)
+
+    s_norm = torch.sqrt(rel_vel.pow(2).sum(dim=2) + eps_s)
+    inv_s = 1.0 / (s_norm + 1e-30)
+    inv_s3 = inv_s.pow(3)
+    c = friction * dt * A_m * link_mask_a                           # [K, M]
+
+    alpha_uu = (c * inv_s).sum(dim=1)                               # [K]
+    v_w = rel_vel * (c * inv_s3).clamp(min=0).sqrt().unsqueeze(2)   # [K, M, 3]
+    H_uu_33 = (alpha_uu.reshape(K, 1, 1) * eye3
+               - torch.bmm(v_w.transpose(1, 2), v_w))               # [K, 3, 3]
+
+    h = (rel_vel * r_nx).sum(dim=2)                                  # [K, M]
+    t_mix = (r_nx / s_norm.unsqueeze(2)
+             - (h / s_norm.pow(2)).unsqueeze(2)
+             * rel_vel / s_norm.unsqueeze(2))                        # [K, M, 3]
+    col = (c.unsqueeze(2) * t_mix).sum(dim=1)                       # [K, 3]
+    rnx_sq = r_nx.pow(2).sum(dim=2)                                  # [K, M]
+    H_ww = (c * (rnx_sq / s_norm - h.pow(2) / s_norm.pow(3))).sum(dim=1)  # [K]
+
+    H_uu_4 = torch.zeros(K, 4, 4, device=dev, dtype=dty)
+    H_uu_4[:, :3, :3] = 0.5 * (H_uu_33 + H_uu_33.transpose(1, 2))
+    H_uu_4[:, :3, 3] = col
+    H_uu_4[:, 3, :3] = col
+    H_uu_4[:, 3, 3] = H_ww
+    H_uu_4 = 0.5 * (H_uu_4 + H_uu_4.transpose(1, 2))
+
+    # Lift J [K, 4, 3]: (α, β, ω) → (u_x, u_y, u_z, ω). Then H_3 = Jᵀ H_4 J.
+    J = torch.zeros(K, 4, 3, device=dev, dtype=dty)
+    J[:, :3, 0] = t0
+    J[:, :3, 1] = t1
+    J[:, 3, 2] = 1.0
+    return torch.matmul(J.transpose(1, 2), torch.matmul(H_uu_4, J))
