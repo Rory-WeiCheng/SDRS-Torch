@@ -421,3 +421,340 @@ def damping_energy(pn_stack: torch.Tensor,
 
     s_norm = torch.sqrt(rel_vel.pow(2).sum(dim=2) + eps_s)
     return (friction * dt * (A_m * s_norm * link_mask_a)).sum()
+
+
+# ---------------------------------------------------------------------------
+# Vertex → pose chain (used by every per-term q-gradient)
+# ---------------------------------------------------------------------------
+
+def vertex_grad_to_q(g_v: torch.Tensor,
+                     q: torch.Tensor,
+                     x_bar: torch.Tensor,
+                     link_to_body: torch.Tensor) -> torch.Tensor:
+    """``∂E/∂q[i] = Σ_{l ∈ i, k} J_lk^T · g_v_lk``  where ``J_lk`` is the FK Jacobian.
+
+    For body i (link l = ``link_to_body^{-1}(i)``):
+        ∂E/∂t_{i, α}    = Σ_v g_v_lkα                                 (translation)
+        ∂E/∂θ_{i, α}    = Σ_v g_v_lk · (diffV[α] × R · x̄_lk)
+                        = (Σ_v R·x̄_lk × g_v_lk) · diffV[α]            (scalar triple)
+
+    Reference: simulator.py:1241-1243 — equivalent to ``J^T g_v`` with our
+    direct-FK-for-free-bodies parameterisation.
+
+    Args:
+        g_v:          [L, M, 3] vertex-level gradient.
+        q, x_bar, link_to_body: as in ``compute_world_vertices``.
+
+    Returns:
+        g_q: [N, 6] with ``g_q[i, :3] = ∂E/∂θ_i``, ``g_q[i, 3:] = ∂E/∂t_i``.
+    """
+    dev, dty = g_v.device, g_v.dtype
+    N = q.shape[0]
+    R, diffV = rodrigues_with_diffV(q[..., :3])                    # [N, 3, 3], [N, 3, 3]
+    R_per_link = R[link_to_body]
+    diffV_per_link = diffV[link_to_body]                           # [L, 3, 3]
+    Rx = torch.einsum('lij,lmj->lmi', R_per_link, x_bar)           # [L, M, 3]
+
+    # ∂/∂t : sum g_v over vertices, scatter to bodies.
+    grad_t_per_link = g_v.sum(dim=1)                                # [L, 3]
+    grad_t = torch.zeros(N, 3, device=dev, dtype=dty).scatter_add_(
+        0, link_to_body.unsqueeze(-1).expand(-1, 3), grad_t_per_link)
+
+    # ∂/∂θ : (Σ Rx × g_v) contracted with diffV[α] for each axis α.
+    cross_sum_per_link = torch.cross(Rx, g_v, dim=-1).sum(dim=1)   # [L, 3]
+    grad_theta_per_link = torch.einsum(
+        'lj,laj->la', cross_sum_per_link, diffV_per_link)           # [L, 3]
+    grad_theta = torch.zeros(N, 3, device=dev, dtype=dty).scatter_add_(
+        0, link_to_body.unsqueeze(-1).expand(-1, 3), grad_theta_per_link)
+
+    return torch.cat([grad_theta, grad_t], dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# Contact: vertex-level + ζ-level gradients of  μ · Σ Ψ_hh'
+# ---------------------------------------------------------------------------
+
+def contact_vertex_grad(wv: torch.Tensor,
+                        p_stack: torch.Tensor,
+                        lid_a: torch.Tensor,
+                        lid_b: torch.Tensor,
+                        vmask: torch.Tensor,
+                        coef: float,
+                        x0: float,
+                        d0_half: float) -> torch.Tensor:
+    """``∂(coef · Σ Ψ_hh')/∂X̃_lk`` accumulated across all pairs.   Returns ``[L, M, 3]``.
+
+    Reference: ``simulator.py:1181-1197``. Direct port with ``mode='log'``.
+        A-side  (all pairs):  g_v[lid_a] += -coef · bg_a · vmask · ν
+        B-side  (link-link):  g_v[lid_b] +=  coef · bg_b · vmask · ν
+        B-side  (ground):     no contribution (ground vertices are static).
+        Normal-magnitude term ``-log(1−‖ν‖)`` does not depend on X̃.
+    """
+    dev, dty = wv.device, wv.dtype
+    K, max_M = p_stack.shape[0], wv.shape[1]
+    L = wv.shape[0]
+    is_ground = lid_b < 0
+    lnk_idx = (~is_ground).nonzero(as_tuple=True)[0]
+
+    g_v = torch.zeros(L, max_M, 3, device=dev, dtype=dty)
+    if K == 0:
+        return g_v
+
+    va_next = wv[lid_a]                                             # [K, M, 3]
+    link_mask_a = vmask[lid_a]                                      # [K, M]
+    ones_KM1 = torch.ones(K, max_M, 1, device=dev, dtype=dty)
+    p3 = p_stack[:, :3]                                             # [K, 3] = ν
+    va_h = torch.cat([va_next, ones_KM1], dim=2)
+    d_a = -torch.einsum('kmi,ki->km', va_h, p_stack)                # [K, M]
+    _, bg_a, _ = barrier_eval(d_a, x0, d0_half, mode='log')
+    bg_m = bg_a * link_mask_a                                       # [K, M]
+    g_v.index_add_(0, lid_a, -coef * bg_m.unsqueeze(2) * p3.unsqueeze(1))
+
+    if lnk_idx.numel() > 0:
+        lid_b_lnk = lid_b[lnk_idx]
+        mask_b_lnk = vmask[lid_b_lnk]
+        vb_next_lnk = wv[lid_b_lnk]
+        ones_lnk = torch.ones(lnk_idx.numel(), max_M, 1, device=dev, dtype=dty)
+        vb_h_lnk = torch.cat([vb_next_lnk, ones_lnk], dim=2)
+        d_b_lnk = torch.einsum('kmi,ki->km', vb_h_lnk, p_stack[lnk_idx])
+        _, bg_b_lnk, _ = barrier_eval(d_b_lnk, x0, d0_half, mode='log')
+        bg_b_lnk_m = bg_b_lnk * mask_b_lnk
+        p3_lnk = p3[lnk_idx]
+        g_v.index_add_(0, lid_b_lnk, coef * bg_b_lnk_m.unsqueeze(2) * p3_lnk.unsqueeze(1))
+
+    return g_v
+
+
+def contact_zeta_grad(wv: torch.Tensor,
+                      p_stack: torch.Tensor,
+                      lid_a: torch.Tensor,
+                      lid_b: torch.Tensor,
+                      vmask: torch.Tensor,
+                      ground_h: torch.Tensor,
+                      coef: float,
+                      x0: float,
+                      d0_half: float) -> torch.Tensor:
+    """``∂(coef · Σ Ψ_hh')/∂(ν_p, δ_p)`` per pair.   Returns ``[K, 4]`` (ν: 0:3, δ: 3).
+
+    Three contributions per pair (matching contact_energy's three sub-blocks):
+        A-side  (5a):    -coef · Σ_k bg_a · vmask · (X̃_ak,  1)            [appears in ∂ν, ∂δ via ∂d_a]
+        B-side ground:    coef · Σ_k bg_b · (X̃_ground_k, 1)
+        B-side link-link: coef · Σ_k bg_b · vmask · (X̃_bk,  1)
+        Normal magnitude: coef · bg_n · ((-ν / ‖ν‖), 0)                    [adds to ∂ν only]
+    """
+    dev, dty = wv.device, wv.dtype
+    K, max_M = p_stack.shape[0], wv.shape[1]
+    is_ground = lid_b < 0
+    gnd_idx = is_ground.nonzero(as_tuple=True)[0]
+    lnk_idx = (~is_ground).nonzero(as_tuple=True)[0]
+
+    g_zeta = torch.zeros(K, 4, device=dev, dtype=dty)
+    if K == 0:
+        return g_zeta
+
+    va_next = wv[lid_a]
+    link_mask_a = vmask[lid_a]
+    ones_KM1 = torch.ones(K, max_M, 1, device=dev, dtype=dty)
+    va_h = torch.cat([va_next, ones_KM1], dim=2)                    # [K, M, 4]
+    d_a = -torch.einsum('kmi,ki->km', va_h, p_stack)
+    _, bg_a, _ = barrier_eval(d_a, x0, d0_half, mode='log')
+    bg_m_a = (bg_a * link_mask_a).unsqueeze(2)                      # [K, M, 1]
+    # ∂d_a/∂(ν, δ) = -(va_h). So contribution = -coef · bg · va_h.
+    g_zeta = g_zeta + (-coef * bg_m_a * va_h).sum(dim=1)            # [K, 4]
+
+    # Normal-magnitude term: -log(1 − ‖ν‖). Only affects ν (not δ).
+    p3 = p_stack[:, :3]
+    norm_p = torch.norm(p3, dim=1, keepdim=True).clamp(min=1e-30)   # [K, 1]
+    _, bg_n, _ = barrier_eval(1.0 - torch.norm(p3, dim=1), x0, mode='log')
+    # ∂(1 − ‖ν‖)/∂ν = -ν/‖ν‖.  d(val)/dν = bg · (-ν/‖ν‖).
+    g_zeta[:, :3] = g_zeta[:, :3] + coef * bg_n.unsqueeze(1) * (-p3 / norm_p)
+
+    if gnd_idx.numel() > 0:
+        p_gnd = p_stack[gnd_idx]
+        d_b_gnd = torch.einsum('gi,ki->kg', ground_h, p_gnd)        # [K_gnd, Mg]
+        _, bg_b_gnd, _ = barrier_eval(d_b_gnd, x0, d0_half, mode='log')
+        # ∂d_b_gnd/∂(ν, δ) = +ground_h.  contribution = +coef · bg · ground_h.
+        # ground_h is shared across pairs; einsum to per-pair sum.
+        contrib_gnd = coef * torch.einsum('kg,gi->ki', bg_b_gnd, ground_h)  # [K_gnd, 4]
+        g_zeta[gnd_idx] = g_zeta[gnd_idx] + contrib_gnd
+
+    if lnk_idx.numel() > 0:
+        lid_b_lnk = lid_b[lnk_idx]
+        mask_b_lnk = vmask[lid_b_lnk]
+        vb_next_lnk = wv[lid_b_lnk]
+        ones_lnk = torch.ones(lnk_idx.numel(), max_M, 1, device=dev, dtype=dty)
+        vb_h_lnk = torch.cat([vb_next_lnk, ones_lnk], dim=2)        # [K_lnk, M, 4]
+        d_b_lnk = torch.einsum('kmi,ki->km', vb_h_lnk, p_stack[lnk_idx])
+        _, bg_b_lnk, _ = barrier_eval(d_b_lnk, x0, d0_half, mode='log')
+        bg_m_b = (bg_b_lnk * mask_b_lnk).unsqueeze(2)               # [K_lnk, M, 1]
+        contrib_lnk = (coef * bg_m_b * vb_h_lnk).sum(dim=1)         # [K_lnk, 4]
+        g_zeta[lnk_idx] = g_zeta[lnk_idx] + contrib_lnk
+
+    return g_zeta
+
+
+# ---------------------------------------------------------------------------
+# Damping (friction): vertex-level gradient of  η · Σ D_hh'
+# ---------------------------------------------------------------------------
+
+def damping_vertex_grad(pn_stack: torch.Tensor,
+                        u_stack: torch.Tensor,
+                        wv_next: torch.Tensor,
+                        wv_curr: torch.Tensor,
+                        lid_a: torch.Tensor,
+                        lid_b: torch.Tensor,
+                        lnk_idx: torch.Tensor,
+                        vmask: torch.Tensor,
+                        friction: float,
+                        coef: float,
+                        x0: float,
+                        d0_half: float,
+                        dt: float,
+                        eps_n: float = 1e-8,
+                        eps_s: float = 1e-4) -> torch.Tensor:
+    """``∂(η · Σ D_hh')/∂X̃_lk`` via the slip-velocity term.   Returns ``[L, M, 3]``.
+
+    Reference: ``simulator.py:1199-1238`` (friction part of ``_compute_energy``).
+    Only the slip term ``s_norm = √(‖v^∥‖² + ε_s)`` depends on ``wv_next``;
+    the normal-load weight ``A_m`` uses ``wv_curr`` (= X^-) and is treated as
+    constant for this vertex gradient. dt cancels (analytic derivation):
+        ∂(friction·dt·A_m·s_norm)/∂wv_next = friction · A_m · T·(rel_vel/s_norm).
+
+    Same calling convention as ``damping_energy`` (caller chooses
+    ``wv_curr = wv_next.detach()`` for quasi-static use).
+    """
+    dev, dty = wv_next.device, wv_next.dtype
+    K = pn_stack.shape[0]
+    L, max_M = wv_next.shape[0], wv_next.shape[1]
+
+    g_v = torch.zeros(L, max_M, 3, device=dev, dtype=dty)
+    if K == 0:
+        return g_v
+
+    va_next = wv_next[lid_a]
+    va_curr = wv_curr[lid_a]
+    link_mask_a = vmask[lid_a]
+    ones_KM1 = torch.ones(K, max_M, 1, device=dev, dtype=dty)
+
+    n_vecs = pn_stack[:, :3]
+    norm_n = torch.norm(n_vecs, dim=1, keepdim=True) + eps_n
+    n_hat = n_vecs / norm_n
+    eye3 = torch.eye(3, device=dev, dtype=dty)
+    Proj = eye3.unsqueeze(0) - n_hat.unsqueeze(2) * n_hat.unsqueeze(1)
+    u_xyz, omega_stack, _, _ = _unified_u_to_xyz_omega(u_stack, n_hat)
+
+    vel_a = (va_next - va_curr) / dt
+    vel = vel_a.clone()
+    if lnk_idx.numel() > 0:
+        lid_b_lnk = lid_b[lnk_idx]
+        vb_next_f = wv_next[lid_b_lnk]
+        vb_curr_f = wv_curr[lid_b_lnk]
+        vel[lnk_idx] = vel[lnk_idx] - (vb_next_f - vb_curr_f) / dt
+
+    tan_vel = torch.einsum('kij,kmj->kmi', Proj, vel)
+    r_nx = torch.cross(n_hat.unsqueeze(1), va_curr, dim=2)
+    omega_term = omega_stack.view(K, 1, 1) * r_nx
+    rel_vel = tan_vel - u_xyz.unsqueeze(1) - omega_term
+
+    va_h_fn = torch.cat([va_curr, ones_KM1], dim=2)
+    d_fn = -torch.einsum('kmi,ki->km', va_h_fn, pn_stack)
+    _, bg_fn, _ = barrier_eval(d_fn, x0, d0_half, mode='log')
+    pn3 = pn_stack[:, :3]
+    f_vec = coef * bg_fn.unsqueeze(2) * pn3.unsqueeze(1)
+    fn_sq = f_vec.pow(2).sum(dim=2)
+    A_m = torch.sqrt(fn_sq + eps_s) - (eps_s ** 0.5)
+
+    s_norm = torch.sqrt(rel_vel.pow(2).sum(dim=2) + eps_s)
+    inv_s = 1.0 / (s_norm + 1e-30)
+    w_fric = (A_m * link_mask_a).unsqueeze(2)
+    rel_over_s = rel_vel * inv_s.unsqueeze(2)
+    proj_rs = torch.einsum('kij,kmj->kmi', Proj, rel_over_s)
+    g_fric_s = friction * w_fric * proj_rs                          # [K, M, 3]
+
+    g_v.index_add_(0, lid_a, g_fric_s)
+    if lnk_idx.numel() > 0:
+        lid_b_lnk = lid_b[lnk_idx]
+        g_v.index_add_(0, lid_b_lnk, -g_fric_s[lnk_idx])
+
+    return g_v
+
+
+def damping_u_grad(pn_stack: torch.Tensor,
+                   u_stack: torch.Tensor,
+                   wv_next: torch.Tensor,
+                   wv_curr: torch.Tensor,
+                   lid_a: torch.Tensor,
+                   lid_b: torch.Tensor,
+                   lnk_idx: torch.Tensor,
+                   vmask: torch.Tensor,
+                   friction: float,
+                   coef: float,
+                   x0: float,
+                   d0_half: float,
+                   dt: float,
+                   eps_n: float = 1e-8,
+                   eps_s: float = 1e-4) -> torch.Tensor:
+    """``∂(η · Σ D_hh')/∂u_unified`` per pair.   Returns ``[K, 3]``.
+
+    Reference: ``simulator.py:1836-1841`` (``g_u3_mh``, ``g_om_mh``,
+    ``_friction_reduce_g``).
+        g_u3 = -Σ_v c · (rel_vel / s_norm)                       [K, 3] = ∂D/∂u_xyz
+        g_om = -Σ_v c · (h / s_norm),  h = rel_vel · r_nx        [K]    = ∂D/∂ω
+        g_u_unified = (g_u3 · t0,  g_u3 · t1,  g_om)
+        where c = friction · dt · A_m · vmask.
+
+    Note: matches SDRS's "friction-plane snap" pattern — the direct
+    contributions of (ν, δ) to D are not included here (they're captured
+    via the cross-Hessian / vertex-side gradient through wv).
+    """
+    dev, dty = wv_next.device, wv_next.dtype
+    K = pn_stack.shape[0]
+    if K == 0:
+        return torch.zeros(0, 3, device=dev, dtype=dty)
+
+    max_M = wv_next.shape[1]
+    va_next = wv_next[lid_a]
+    va_curr = wv_curr[lid_a]
+    link_mask_a = vmask[lid_a]
+    ones_KM1 = torch.ones(K, max_M, 1, device=dev, dtype=dty)
+
+    n_vecs = pn_stack[:, :3]
+    norm_n = torch.norm(n_vecs, dim=1, keepdim=True) + eps_n
+    n_hat = n_vecs / norm_n
+    eye3 = torch.eye(3, device=dev, dtype=dty)
+    Proj = eye3.unsqueeze(0) - n_hat.unsqueeze(2) * n_hat.unsqueeze(1)
+    u_xyz, omega_stack, t0, t1 = _unified_u_to_xyz_omega(u_stack, n_hat)
+
+    vel_a = (va_next - va_curr) / dt
+    vel = vel_a.clone()
+    if lnk_idx.numel() > 0:
+        lid_b_lnk = lid_b[lnk_idx]
+        vb_next_f = wv_next[lid_b_lnk]
+        vb_curr_f = wv_curr[lid_b_lnk]
+        vel[lnk_idx] = vel[lnk_idx] - (vb_next_f - vb_curr_f) / dt
+
+    tan_vel = torch.einsum('kij,kmj->kmi', Proj, vel)
+    r_nx = torch.cross(n_hat.unsqueeze(1), va_curr, dim=2)
+    omega_term = omega_stack.view(K, 1, 1) * r_nx
+    rel_vel = tan_vel - u_xyz.unsqueeze(1) - omega_term
+
+    va_h_fn = torch.cat([va_curr, ones_KM1], dim=2)
+    d_fn = -torch.einsum('kmi,ki->km', va_h_fn, pn_stack)
+    _, bg_fn, _ = barrier_eval(d_fn, x0, d0_half, mode='log')
+    pn3 = pn_stack[:, :3]
+    f_vec = coef * bg_fn.unsqueeze(2) * pn3.unsqueeze(1)
+    fn_sq = f_vec.pow(2).sum(dim=2)
+    A_m = torch.sqrt(fn_sq + eps_s) - (eps_s ** 0.5)
+
+    s_norm = torch.sqrt(rel_vel.pow(2).sum(dim=2) + eps_s)
+    inv_s = 1.0 / (s_norm + 1e-30)
+
+    c = friction * dt * A_m * link_mask_a                           # [K, M]
+    rel_over_s = rel_vel * inv_s.unsqueeze(2)
+    g_u3 = -(c.unsqueeze(2) * rel_over_s).sum(dim=1)                # [K, 3]
+    h = (rel_vel * r_nx).sum(dim=2)                                  # [K, M]
+    g_om = -(c * h * inv_s).sum(dim=1)                               # [K]
+
+    g_alpha = (g_u3 * t0).sum(dim=1)
+    g_beta = (g_u3 * t1).sum(dim=1)
+    return torch.stack([g_alpha, g_beta, g_om], dim=1)              # [K, 3]
