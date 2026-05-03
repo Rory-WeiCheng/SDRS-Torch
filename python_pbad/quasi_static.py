@@ -39,11 +39,14 @@ Public API — table of contents:
       frictionless_wrench(X, contact_data, g, ...)        — w ∈ ℝ^(N,6)
       friction_wrench(X, f^∥, lid_a, link_to_body, ...)   — w^∥ ∈ ℝ^(N,6)
 
-  Section 7  CVX friction layer                           [TODO]
-      solve_friction_forces(X, p*, w, η, ...)             — f*^∥
+  Section 7  CVX friction layer
+      FrictionLayer(...)                                  — SOCP via CVXPYLayers
+        forward: f*^∥ = argmin ‖w − w^∥(f)‖²
+        backward: KKT-implicit differentiation
 
-  Section 8  Loss                                         [TODO]
-      physics_loss(X, G, ...)                             — Σ_g ‖w − w^∥‖²
+  Section 8  Physics-aware loss
+      physics_loss(X, ..., g_vec)                         — L = ‖w − w^∥(f*)‖²
+      physics_loss_aggregate(X, ..., g_vec_list)          — Σ_g L_phys(X, g)
 
 This module reuses ``simulator.barrier_eval`` (mode='log') for the global log
 barrier; everything else is self-contained.
@@ -1145,6 +1148,13 @@ class FrictionLayer:
                  lid_b: torch.Tensor,
                  M: int,
                  M_env: int):
+        """
+        Args:
+            link_to_body, lid_a, lid_b, M, M_env: scene topology.
+
+        Forward solve uses Clarabel (Newton-based interior-point) routed via
+        cvxpylayers' DIFFCP backward path (KKT-implicit differentiation).
+        """
         N = int(link_to_body.max().item()) + 1
         K = lid_a.shape[0]
         is_env = lid_b < 0
@@ -1217,6 +1227,9 @@ class FrictionLayer:
         problem = cp.Problem(objective, constraints)
         assert problem.is_dpp(), "friction-layer problem is not DPP-compliant"
 
+        # cvxpylayers >=1.1 default backward path is DIFFCP; the forward cone
+        # solver (Clarabel here) is selected per-call via
+        # ``solver_args={'solve_method': 'Clarabel', ...}`` in __call__.
         self.layer = CvxpyLayer(
             problem,
             parameters=[W, n_hat_per_v, cone_bounds, T_balance, w_target],
@@ -1329,7 +1342,8 @@ class FrictionLayer:
                  contact_data: dict,
                  w_target: torch.Tensor,
                  eta: float,
-                 p_star: torch.Tensor):
+                 p_star: torch.Tensor,
+                 solver_args: dict = None):
         """Forward solve.   Returns ``(f_a, f_b_lnk, f_b_env)``.
 
         Args:
@@ -1353,11 +1367,15 @@ class FrictionLayer:
         T_balance   = self._build_T_balance(n_hat_per_pair, X, env_h)
         w_flat      = w_target.flatten()
 
-        # Solve.  Tighten SCS tolerance from its default ~1e-3 to 1e-6 — gives
-        # constraint residuals around 1e-6, matching our test tolerance.
-        (f,) = self.layer(
-            W, n_hat_per_v, cone_bounds, T_balance, w_flat,
-            solver_args={'eps': 1e-6, 'max_iters': 100000})
+        # Solve via Clarabel (Newton-based interior-point) routed through
+        # diffcp.  ``tol_*`` are Clarabel's per-residual tolerances.
+        sa = {'solve_method': 'Clarabel',
+              'tol_gap_abs': 1e-9, 'tol_gap_rel': 1e-9, 'tol_feas': 1e-9,
+              'max_iter': 200, 'verbose': False}
+        if solver_args:
+            sa.update(solver_args)
+        (f,) = self.layer(W, n_hat_per_v, cone_bounds, T_balance, w_flat,
+                          solver_args=sa)
         # Reshape into the three friction-variable groups.
         f_a     = f[:self.F_a].reshape(self.K, self.M, 3)
         f_b_lnk = (f[self.F_a:self.F_a + self.F_b_lnk]
@@ -1365,3 +1383,136 @@ class FrictionLayer:
         f_b_env = (f[self.F_a + self.F_b_lnk:]
                    .reshape(self.K_env, self.M_env, 3)) if self.K_env > 0 else None
         return f_a, f_b_lnk, f_b_env
+
+
+# =============================================================================
+# Section 8: Physics-aware loss  (formulation 3, §F)
+# =============================================================================
+#
+#     L_phys(X, g) = ‖ w(X, g) − w^∥(X, f*^∥(X, g)) ‖²
+#
+# Wires the upstream pieces into a single end-to-end scalar loss:
+#   1. p*           = solve_normal_planes(p_init, X, ...)
+#   2. contact_data = compute_contact_per_pair(p*, X, ...)
+#   3. w            = frictionless_wrench(X, contact_data, g, ...)
+#   4. f*           = friction_layer(X, env_h, contact_data, w, η, p*)
+#   5. w^∥          = friction_wrench(X, f*, ...)
+#   6. L            = ‖w − w^∥‖²
+#
+# All steps are differentiable in X via PyTorch autograd:
+#   - normal-plane LM: autograd through ~6 iterations of damped Newton
+#     (torch.linalg.solve, torch.where are all autograd-supported);
+#   - contact_data, wrenches: pure analytic primitives;
+#   - friction layer: KKT-implicit differentiation built into CVXPYLayers.
+# So ``loss.backward()`` yields ∂L/∂X correctly out of the box; the
+# Implicit-Function-Theorem optimisation of the inner solves is left as a
+# future speed-up, not a correctness requirement.
+
+def physics_loss(X: torch.Tensor,
+                 env_h: torch.Tensor,
+                 lid_a: torch.Tensor,
+                 lid_b: torch.Tensor,
+                 link_to_body: torch.Tensor,
+                 vmask: torch.Tensor,
+                 rho_2d: torch.Tensor,
+                 g_vec: torch.Tensor,
+                 eta: float,
+                 friction_layer: 'FrictionLayer',
+                 coef: float,
+                 x0: float,
+                 d0_half: float,
+                 p_init: torch.Tensor,
+                 normal_solve_kwargs: dict = None,
+                 friction_solver_args: dict = None):
+    """End-to-end physics-aware loss for a single gravity vector.
+
+    Args:
+        X:               [L, M, 3]  world vertices.
+        env_h:           [M_env, 4] homogeneous static-environment vertices.
+        lid_a, lid_b:    [K]        per-pair link indices (lid_b = -1 → env).
+        link_to_body:    [L]        link → body index.
+        vmask, rho_2d:   [L, M]     vertex mask + per-vertex mass.
+        g_vec:           [3]        gravity vector.
+        eta:             float      Coulomb friction coefficient.
+        friction_layer:  FrictionLayer matching the topology.
+        coef, x0, d0_half: barrier params.
+        p_init:          [K, 4]     warm-start for the normal-plane LM.
+        normal_solve_kwargs: dict, forwarded to ``solve_normal_planes``.
+
+    Returns:
+        loss: scalar torch.Tensor, autograd-connected to X.
+        info: dict with intermediate states (``p_star``, ``w``, ``w_par``,
+              ``residual``, ``f_a``, ``f_b_lnk``, ``f_b_env``,
+              ``normal_solve_info``) — useful for diagnostics + tests.
+    """
+    kw = dict(normal_solve_kwargs or {})
+
+    # 1. Normal-plane inner solve.
+    p_star, ns_info = solve_normal_planes(
+        p_init, X, lid_a, lid_b, vmask, env_h, coef, x0, d0_half, **kw)
+
+    # 2. Per-pair contact data at the converged p*.
+    contact_data = compute_contact_per_pair(
+        p_star, X, lid_a, lid_b, vmask, env_h, coef, x0, d0_half)
+
+    # 3. Frictionless residual wrench  w(X, g).
+    w = frictionless_wrench(X, contact_data, g_vec,
+                            link_to_body, rho_2d, vmask, lid_a)
+
+    # 4. Friction SOCP  →  f*^∥(X, g).
+    f_a, f_b_lnk, f_b_env = friction_layer(
+        X, env_h, contact_data, w, eta, p_star,
+        solver_args=friction_solver_args)
+
+    # 5. Friction wrench  w^∥(X, f*).
+    w_par = friction_wrench(
+        X, f_a, lid_a, link_to_body,
+        f_par_b_lnk=f_b_lnk, lid_b_lnk=friction_layer.lid_b_lnk)
+
+    # 6. Loss  =  ‖w − w^∥‖².
+    residual = w - w_par
+    loss = (residual * residual).sum()
+
+    info = {
+        'p_star': p_star,
+        'normal_solve_info': ns_info,
+        'contact_data': contact_data,
+        'w': w,
+        'w_par': w_par,
+        'residual': residual,
+        'f_a': f_a,
+        'f_b_lnk': f_b_lnk,
+        'f_b_env': f_b_env,
+    }
+    return loss, info
+
+
+def physics_loss_aggregate(X: torch.Tensor,
+                           env_h: torch.Tensor,
+                           lid_a: torch.Tensor,
+                           lid_b: torch.Tensor,
+                           link_to_body: torch.Tensor,
+                           vmask: torch.Tensor,
+                           rho_2d: torch.Tensor,
+                           g_vec_list,
+                           eta: float,
+                           friction_layer: 'FrictionLayer',
+                           coef: float,
+                           x0: float,
+                           d0_half: float,
+                           p_init: torch.Tensor,
+                           normal_solve_kwargs: dict = None):
+    """Sum ``physics_loss`` over a finite set of gravity directions  (spec §F).
+
+    L_phys(X) = Σ_{g ∈ G} L_phys(X, g)
+    """
+    total = X.new_zeros(())
+    infos = []
+    for g_vec in g_vec_list:
+        loss_g, info_g = physics_loss(
+            X, env_h, lid_a, lid_b, link_to_body, vmask, rho_2d,
+            g_vec, eta, friction_layer, coef, x0, d0_half, p_init,
+            normal_solve_kwargs=normal_solve_kwargs)
+        total = total + loss_g
+        infos.append(info_g)
+    return total, infos

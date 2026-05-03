@@ -2,6 +2,7 @@
 # upstream library API; kept out of source control to keep the fork's
 # upstream-mergeable history clean.
 python_pbad/tests/
+python_pbad/SETUP.md
 
 # Python cache.
 __pycache__/
