@@ -1,0 +1,15 @@
+# Local-only Stage III formulation-3 development tests — not part of the
+# upstream library API; kept out of source control to keep the fork's
+# upstream-mergeable history clean.
+python_pbad/tests/
+
+# Python cache.
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Editor / OS noise.
+.DS_Store
+*.swp
