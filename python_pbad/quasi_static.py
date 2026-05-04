@@ -9,23 +9,38 @@ tangential friction forces solved by an inner SOCP layer.
 
 Public API — table of contents:
 
-  Section 1  Kinematics (rotations + FK + vertex→pose chain)
-      _skew_batched(v)                                    — utility
+  Shared utility (used by both layers below)
+      _skew_batched(v)                                    — [v]_× batch
+
+  ─────────────────────────────────────────────────────────────────────────
+  Naive reference primitives  (NOT on the physics_loss production path)
+  ─────────────────────────────────────────────────────────────────────────
+  Each computes ONE quantity in the obvious un-fused way.  Exists as a
+  vertex-by-vertex regression reference for the fused per-pair compute below
+  (Section 4).  ``tests/test_primitives.py`` asserts the two layers agree
+  numerically.  Two functions carry an ``_ref_`` prefix because their
+  un-prefixed names also exist in ``stage3.{energy,scene_adapter}`` with
+  different signatures — the prefix makes the parity-only role explicit
+  and removes the cross-module name collision.
+
+  Ref §1  Kinematics references  (q-style FK + grad chain)
       rodrigues(theta)                                    — R(θ) ∈ SO(3)
       rodrigues_with_diffV(theta)                         — R + diffV
-      compute_world_vertices(q, x_bar, link_to_body)      — X̃ = R·x̄ + t
+      _ref_compute_world_vertices_q(q, x_bar, link_to_body) — X̃ = R·x̄ + t
       vertex_grad_to_q(g_v, q, x_bar, link_to_body)       — chain g_v → ∇_q
-
-  Section 2  Gravity
-      gravity_energy(wv, rho_2d, gravity, vmask)          — Ψ_g
-      gravity_grad_q(...)                                 — ∇_q Ψ_g (analytic)
-
-  Section 3  Contact primitives  (separating-plane barrier)
+  Ref §2  Gravity references  (Y-up scalar)
+      _ref_gravity_energy_yup(wv, rho_2d, gravity, vmask) — Ψ_g
+      gravity_grad_q(...)                                 — ∇_q Ψ_g
+  Ref §3  Contact primitive references  (one quantity per fn)
       contact_energy(wv, p_stack, ...)                    — μ · Σ Ψ_hh'
-      _contact_energy_per_pair(...)                       — per-pair [K] (internal)
+      _contact_energy_per_pair(...)                       — per-pair [K]
       contact_vertex_grad(...)                            — ∂Ψ_c/∂X̃   [L,M,3]
       contact_zeta_grad(...)                              — ∂Ψ_c/∂(ν,δ) [K,4]
       contact_pp_hess(...)                                — ∂²Ψ_c/∂(ν,δ)² [K,4,4]
+
+  ─────────────────────────────────────────────────────────────────────────
+  Production fast path  (called by physics_loss)
+  ─────────────────────────────────────────────────────────────────────────
 
   Section 4  Fused contact per-pair compute
       compute_contact_per_pair(p, wv, ...)                — single shared pass
@@ -65,23 +80,9 @@ from simulator import barrier_eval
 
 
 # =============================================================================
-# Section 1: Kinematics (rotations + FK + vertex→pose chain)
+# Shared utility (used by both the parity references below AND the production
+# fast path further down — FrictionLayer._build_W).
 # =============================================================================
-#
-# The new formulation parameterises rotation as ``R(θ) = exp([θ]_×)`` with
-# ``θ ∈ ℝ³`` (axis-angle).  SDRS-Torch's ``Robot.forward_kinematics`` uses
-# ZYX Euler for its 'free' joint type (robot.py:328-331); since our scene
-# is just N free 6-DOF bodies (each with M_per_body[i] hulls connected by
-# fixed joints), we bypass the Robot abstraction and compute world vertices
-# directly via Rodrigues.  ``link_to_body[l]`` tells us which body a given
-# hull belongs to.
-#
-# Forward Rodrigues uses the PyTorch3D-style closed form:
-#   R = I + sin(t)/t · [θ]_× + (1 − cos t)/t² · [θ]²_×
-# ``torch.sinc`` handles sin(t)/t at all t (including t = 0); the (1 − cos)/t²
-# term uses a ``torch.where(t² == 0, 1, t²)`` denominator clamp — at t = 0
-# the numerator is also 0, so 0/1 = 0 multiplied by [θ]²_× (also 0) → identity.
-# No explicit Taylor branch needed for typical use (fp64 precision).
 
 def _skew_batched(v: torch.Tensor) -> torch.Tensor:
     """v [..., 3] → [v]_× [..., 3, 3]."""
@@ -92,6 +93,40 @@ def _skew_batched(v: torch.Tensor) -> torch.Tensor:
     K[..., 2, 0] = -vy; K[..., 2, 1] = vx
     return K
 
+
+# #############################################################################
+# ###                                                                       ###
+# ###    BEGIN  —  Naive reference primitives  (PARITY-ONLY)                ###
+# ###                                                                       ###
+# ###    NOT on the physics_loss production path.  Each function below      ###
+# ###    computes ONE quantity in the obvious un-fused way.  The fused      ###
+# ###    fast path is ``compute_contact_per_pair`` further down.            ###
+# ###    ``tests/test_primitives.py`` checks that the two layers agree      ###
+# ###    vertex-by-vertex — so a future drift in either layer surfaces      ###
+# ###    immediately, with the disagreeing primitive identifying the bug.   ###
+# ###                                                                       ###
+# ###    Two functions in this section carry an ``_ref_`` prefix because    ###
+# ###    their un-prefixed names also exist in ``stage3.{energy,            ###
+# ###    scene_adapter}`` with different (R,t)-style signatures — the       ###
+# ###    prefix prevents cross-module name confusion.                       ###
+# ###                                                                       ###
+# #############################################################################
+
+# -----------------------------------------------------------------------------
+# Ref §1: Kinematics references (q-style FK + grad chain)
+# -----------------------------------------------------------------------------
+#
+# The new formulation parameterises rotation as ``R(θ) = exp([θ]_×)`` with
+# ``θ ∈ ℝ³`` (axis-angle).  SDRS-Torch's ``Robot.forward_kinematics`` uses
+# ZYX Euler for its 'free' joint type (robot.py:328-331); since our scene
+# is just N free 6-DOF bodies (each with M_per_body[i] hulls connected by
+# fixed joints), we bypass the Robot abstraction and compute world vertices
+# directly via Rodrigues.
+#
+# Forward Rodrigues uses the PyTorch3D-style closed form:
+#   R = I + sin(t)/t · [θ]_× + (1 − cos t)/t² · [θ]²_×
+# ``torch.sinc`` handles sin(t)/t at all t (including t = 0); the (1 − cos)/t²
+# term uses a ``torch.where(t² == 0, 1, t²)`` denominator clamp.
 
 def rodrigues(theta: torch.Tensor) -> torch.Tensor:
     """Axis-angle to rotation matrix, batched.   θ [..., 3] → R [..., 3, 3].
@@ -144,9 +179,9 @@ def rodrigues_with_diffV(theta: torch.Tensor):
     return R, diffV
 
 
-def compute_world_vertices(q: torch.Tensor,
-                           x_bar: torch.Tensor,
-                           link_to_body: torch.Tensor) -> torch.Tensor:
+def _ref_compute_world_vertices_q(q: torch.Tensor,
+                                  x_bar: torch.Tensor,
+                                  link_to_body: torch.Tensor) -> torch.Tensor:
     """X̃ = R(θ_i) · x̄_lk + t_i,  where i = ``link_to_body[l]``.
 
     Reference (analogue): ``simulator.py:478-484`` (``_get_wv_stacked``); we
@@ -187,7 +222,7 @@ def vertex_grad_to_q(g_v: torch.Tensor,
 
     Args:
         g_v:          [L, M, 3] vertex-level gradient.
-        q, x_bar, link_to_body: as in ``compute_world_vertices``.
+        q, x_bar, link_to_body: as in ``_ref_compute_world_vertices_q``.
 
     Returns:
         g_q: [N, 6] with ``g_q[i, :3] = ∂E/∂θ_i``, ``g_q[i, 3:] = ∂E/∂t_i``.
@@ -215,20 +250,20 @@ def vertex_grad_to_q(g_v: torch.Tensor,
 
 
 # =============================================================================
-# Section 2: Gravity
-# =============================================================================
+# Ref §2: Gravity references (Y-up scalar — parity only)
+# -----------------------------------------------------------------------------
 #
-# Ψ_g = -Σ_lk m_lk · g · X̃_lk      (Y-up scalar gravity in current API)
+# Ψ_g = -Σ_lk m_lk · g · X̃_lk      (Y-up scalar form, SDRS-Torch parity)
 #
-# In formulation 3 we evaluate at q = 0; the closed-form gravity wrench at
-# q = 0 is built directly inside ``frictionless_wrench`` (§ section 6).  The
-# more general ``gravity_grad_q`` (any θ) is kept here for symmetry with the
-# SDRS reference and for possible reuse outside the q = 0 evaluation point.
+# Production gravity flows through ``frictionless_wrench`` (Section 6) which
+# takes a free 3-vector ``g`` and is axis-agnostic.  The two functions below
+# are reference-only — they exist so ``test_primitives.py`` can validate the
+# closed-form gravity wrench built inside ``frictionless_wrench``.
 
-def gravity_energy(wv: torch.Tensor,
-                   rho_2d: torch.Tensor,
-                   gravity: float,
-                   vmask: torch.Tensor) -> torch.Tensor:
+def _ref_gravity_energy_yup(wv: torch.Tensor,
+                            rho_2d: torch.Tensor,
+                            gravity: float,
+                            vmask: torch.Tensor) -> torch.Tensor:
     """Gravitational potential. Reference: ``simulator.py:594-595`` (``# 2. Gravity``).
 
     Direct port:
@@ -297,9 +332,9 @@ def gravity_grad_q(q: torch.Tensor,
     return torch.cat([grad_theta, grad_t], dim=-1)
 
 
-# =============================================================================
-# Section 3: Contact primitives  (separating-plane barrier)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Ref §3: Contact primitive references (separating-plane barrier — parity only)
+# -----------------------------------------------------------------------------
 #
 # Per pair (h, h'), the barrier potential is
 #     Ψ_hh'(q, X, n, d) = -log(1 − ‖n‖)
@@ -643,6 +678,13 @@ def contact_pp_hess(wv: torch.Tensor,
     H_pp = coef * (H_pp_a + H_pp_b + H_pp_n)
     return 0.5 * (H_pp + H_pp.transpose(1, 2))
 
+
+# #############################################################################
+# ###                                                                       ###
+# ###    END  —  Naive reference primitives  (PARITY-ONLY)                  ###
+# ###    BEGIN  —  Production fast path  (called by physics_loss)           ###
+# ###                                                                       ###
+# #############################################################################
 
 # =============================================================================
 # Section 4: Fused contact per-pair compute
